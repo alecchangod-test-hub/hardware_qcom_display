@@ -17,6 +17,42 @@
  * limitations under the License.
  */
 
+/*
+* Changes from Qualcomm Innovation Center are provided under the following license:
+*
+* Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted (subject to the limitations in the
+* disclaimer below) provided that the following conditions are met:
+*
+*    * Redistributions of source code must retain the above copyright
+*      notice, this list of conditions and the following disclaimer.
+*
+*    * Redistributions in binary form must reproduce the above
+*      copyright notice, this list of conditions and the following
+*      disclaimer in the documentation and/or other materials provided
+*      with the distribution.
+*
+*    * Neither the name of Qualcomm Innovation Center, Inc. nor the names of its
+*      contributors may be used to endorse or promote products derived
+*      from this software without specific prior written permission.
+*
+* NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE
+* GRANTED BY THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT
+* HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
+* WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+* MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+* IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+* ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+* DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
+* GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+* INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER
+* IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+* OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
+* IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
 #define DEBUG 0
 
 #include "gr_buf_mgr.h"
@@ -67,14 +103,23 @@ static uint64_t getMetaDataSize(uint64_t reserved_region_size) {
   return static_cast<uint64_t>(ROUND_UP_PAGESIZE(sizeof(MetaData_t) + reserved_region_size));
 }
 
+#ifdef GRALLOC_HANDLE_HAS_RESERVED_SIZE
+static void unmapAndReset(private_handle_t *handle) {
+  uint64_t reserved_region_size = handle->reserved_size;
+#else
 static void unmapAndReset(private_handle_t *handle, uint64_t reserved_region_size = 0) {
+#endif
   if (private_handle_t::validate(handle) == 0 && handle->base_metadata) {
     munmap(reinterpret_cast<void *>(handle->base_metadata), getMetaDataSize(reserved_region_size));
     handle->base_metadata = 0;
   }
 }
 
+#ifdef GRALLOC_HANDLE_HAS_RESERVED_SIZE
+static int validateAndMap(private_handle_t *handle) {
+#else
 static int validateAndMap(private_handle_t *handle, uint64_t reserved_region_size = 0) {
+#endif
   if (private_handle_t::validate(handle)) {
     ALOGE("%s: Private handle is invalid - handle:%p", __func__, handle);
     return -1;
@@ -85,6 +130,9 @@ static int validateAndMap(private_handle_t *handle, uint64_t reserved_region_siz
   }
 
   if (!handle->base_metadata) {
+#ifdef GRALLOC_HANDLE_HAS_RESERVED_SIZE
+    uint64_t reserved_region_size = handle->reserved_size;
+#endif
     uint64_t size = getMetaDataSize(reserved_region_size);
     void *base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, handle->fd_metadata, 0);
     if (base == reinterpret_cast<void *>(MAP_FAILED)) {
@@ -93,6 +141,7 @@ static int validateAndMap(private_handle_t *handle, uint64_t reserved_region_siz
       return -1;
     }
     handle->base_metadata = (uintptr_t)base;
+#ifndef GRALLOC_HANDLE_HAS_RESERVED_SIZE
 #ifdef METADATA_V2
     // The allocator process gets the reserved region size from the BufferDescriptor.
     // When importing to another process, the reserved size is unknown until mapping the metadata,
@@ -109,6 +158,7 @@ static int validateAndMap(private_handle_t *handle, uint64_t reserved_region_siz
       }
       handle->base_metadata = (uintptr_t)new_base;
     }
+#endif
 #endif
   }
   return 0;
@@ -728,7 +778,11 @@ Error BufferManager::FreeBuffer(std::shared_ptr<Buffer> buf) {
     return Error::BAD_BUFFER;
   }
 
+#ifdef GRALLOC_HANDLE_HAS_RESERVED_SIZE
+  auto meta_size = getMetaDataSize(hnd->reserved_size);
+#else
   auto meta_size = getMetaDataSize(buf->reserved_size);
+#endif
 
   if (allocator_->FreeBuffer(reinterpret_cast<void *>(hnd->base), hnd->size, hnd->offset, hnd->fd,
                              buf->ion_handle_main) != 0) {
@@ -1048,6 +1102,9 @@ Error BufferManager::AllocateBuffer(const BufferDescriptor &descriptor, buffer_h
   }
 
   if (testAlloc) {
+    if (size == 0) {
+       return Error::NO_RESOURCES;
+    }
     return Error::NONE;
   }
 
@@ -1098,6 +1155,9 @@ Error BufferManager::AllocateBuffer(const BufferDescriptor &descriptor, buffer_h
                           descriptor.GetWidth(), descriptor.GetHeight(), format, buffer_type,
                           data.size, usage);
 
+#ifdef GRALLOC_HANDLE_HAS_RESERVED_SIZE
+  hnd->reserved_size = static_cast<unsigned int>(descriptor.GetReservedSize());
+#endif
   hnd->id = ++next_id_;
   hnd->base = 0;
   hnd->base_metadata = 0;
@@ -1108,7 +1168,8 @@ Error BufferManager::AllocateBuffer(const BufferDescriptor &descriptor, buffer_h
     setMetaDataAndUnmap(hnd, SET_GRAPHICS_METADATA, reinterpret_cast<void *>(&graphics_metadata));
   }
 
-#ifdef METADATA_V2
+
+#if !defined(GRALLOC_HANDLE_HAS_RESERVED_SIZE) && defined(METADATA_V2)
   auto error = validateAndMap(hnd, descriptor.GetReservedSize());
 #else
   auto error = validateAndMap(hnd);
@@ -1134,7 +1195,11 @@ Error BufferManager::AllocateBuffer(const BufferDescriptor &descriptor, buffer_h
   metadata->crop.right = hnd->width;
   metadata->crop.bottom = hnd->height;
 
+#ifdef GRALLOC_HANDLE_HAS_RESERVED_SIZE
+  unmapAndReset(hnd);
+#else
   unmapAndReset(hnd, descriptor.GetReservedSize());
+#endif
 
   *handle = hnd;
 
